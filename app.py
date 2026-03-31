@@ -42,22 +42,8 @@ EMERGENCY_KEYWORDS = {
     "severe bleeding",
 }
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder")
-
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
-
-GEMINI_MODEL = None
-if genai and GEMINI_API_KEY:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        GEMINI_MODEL = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception:
-        GEMINI_MODEL = None
 
 
 def classify_intent(text: str) -> str:
@@ -360,27 +346,63 @@ def build_leetcode_prompt(user_text: str, language: str) -> Optional[str]:
     return "\n".join(prompt_parts)
 
 
-def solve_programming_with_gemini(user_text: str) -> Optional[str]:
-    if not GEMINI_MODEL:
-        return None
+def looks_like_valid_leetcode_response(response_text: str, starter_code: str) -> bool:
+    response = response_text.strip()
+    starter = starter_code.strip()
+    if not response or not starter:
+        return False
 
-    language = detect_requested_language(user_text)
-    prompt = build_leetcode_prompt(user_text, language)
-    if not prompt:
-        prompt = (
-            "You are a coding assistant.\n"
-            "Return only the final code by default.\n"
-            "Do not add explanation, steps, complexity, comments before code, or example usage unless the user explicitly asks.\n"
-            f"If language is unspecified, choose {language}.\n\n"
-            f"User request: {user_text}"
-        )
+    starter_lines = [line.rstrip() for line in starter.splitlines() if line.strip()]
+    response_lines = [line.rstrip() for line in response.splitlines() if line.strip()]
+    if not starter_lines or not response_lines:
+        return False
 
+    starter_first = starter_lines[0].strip()
+    response_first = response_lines[0].strip()
+    if starter_first != response_first:
+        return False
+
+    if len(starter_lines) > 1:
+        starter_second = starter_lines[1].strip()
+        if starter_second and not any(line.strip() == starter_second for line in response_lines[:4]):
+            return False
+
+    return True
+
+
+def rewrite_into_leetcode_template(
+    raw_response: str,
+    starter_code: str,
+    language: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": (
+            "Rewrite the candidate solution into exact LeetCode submission format.\n"
+            "Return only code.\n"
+            "Preserve the official starter template structure exactly.\n"
+            "Do not include markdown fences or explanations.\n"
+            f"Language: {language}\n\n"
+            f"Official starter template:\n{starter_code}\n\n"
+            f"Candidate solution:\n{raw_response}"
+        ),
+        "stream": False,
+    }
     try:
-        result = GEMINI_MODEL.generate_content(prompt)
-        text = (getattr(result, "text", "") or "").strip()
-        return text or None
-    except Exception:
-        return None
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json=payload,
+            timeout=OLLAMA_TIMEOUT,
+        )
+        response.raise_for_status()
+        text = (response.json().get("response") or "").strip()
+        if text:
+            return text, None
+        return None, "Template rewrite returned an empty response."
+    except requests.RequestException as exc:
+        return None, f"Template rewrite failed: {exc}"
+    except Exception as exc:
+        return None, f"Unexpected template rewrite error: {exc}"
 
 
 def solve_programming_with_ollama(user_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -423,13 +445,27 @@ def solve_programming_with_ollama(user_text: str) -> Tuple[Optional[str], Option
 
 
 def programming_response(user_text: str) -> str:
+    language = detect_requested_language(user_text)
+    question_number = extract_leetcode_number(user_text)
     ollama_answer, ollama_error = solve_programming_with_ollama(user_text)
     if ollama_answer:
+        if question_number:
+            title_slug = get_leetcode_problem_slug(question_number)
+            if title_slug:
+                details = get_leetcode_problem_details(title_slug)
+                if details:
+                    starter_code = get_leetcode_code_snippet(details, language)
+                    if starter_code and not looks_like_valid_leetcode_response(ollama_answer, starter_code):
+                        rewritten, rewrite_error = rewrite_into_leetcode_template(
+                            ollama_answer,
+                            starter_code,
+                            language,
+                        )
+                        if rewritten and looks_like_valid_leetcode_response(rewritten, starter_code):
+                            return rewritten
+                        if rewrite_error:
+                            ollama_error = rewrite_error
         return ollama_answer
-
-    llm_answer = solve_programming_with_gemini(user_text)
-    if llm_answer:
-        return llm_answer
 
     return (
         f"{random.choice(HUMAN_OPENERS)}\n"
