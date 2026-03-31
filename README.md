@@ -48,5 +48,3 @@ Use a different Ollama server URL:
 ```bash
 setx OLLAMA_BASE_URL "http://127.0.0.1:11434"
 ```
-
-Gemini is still supported as a secondary fallback if you add `GEMINI_API_KEY`.
