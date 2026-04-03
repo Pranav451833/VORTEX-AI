@@ -1,6 +1,7 @@
 import os
 import random
 import re
+import logging
 from datetime import datetime
 from html import unescape
 from typing import Dict, Optional, Tuple
@@ -10,7 +11,16 @@ import xml.etree.ElementTree as ET
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
+try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv()
+
 app = Flask(__name__, static_folder="static")
+logging.basicConfig(level=logging.INFO)
 
 REQUEST_TIMEOUT = 8
 OLLAMA_TIMEOUT = 120
@@ -44,6 +54,10 @@ EMERGENCY_KEYWORDS = {
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/auto")
+OPENROUTER_TIMEOUT = 60
 
 
 def classify_intent(text: str) -> str:
@@ -69,6 +83,7 @@ def classify_intent(text: str) -> str:
             "program",
             "leetcode",
             "leet",
+            "leet code",
         ]
     ):
         return "programming"
@@ -142,7 +157,8 @@ def get_weather_summary(city: str) -> str:
 
         for i in range(min(3, len(dates))):
             day = datetime.fromisoformat(dates[i]).strftime("%a")
-            lines.append(f"{day}: {t_min[i]} C to {t_max[i]} C, rain chance ~{rain[i]}%.")
+            lines.append(
+                f"{day}: {t_min[i]} C to {t_max[i]} C, rain chance ~{rain[i]}%.")
 
         lines.append("Weather can change fast, so check again before travel.")
         return "\n".join(lines)
@@ -167,7 +183,8 @@ def get_news_summary(topic: str) -> str:
             title = unescape((item.findtext("title") or "").strip())
             lines.append(f"{idx}. {title}")
 
-        lines.append("If you want, ask: 'news about AI' or 'news about cricket'.")
+        lines.append(
+            "If you want, ask: 'news about AI' or 'news about cricket'.")
         return "\n".join(lines)
     except Exception:
         return "News service is temporarily unavailable. Try again in a moment."
@@ -257,7 +274,8 @@ def get_leetcode_problem_details(title_slug: str) -> Optional[Dict[str, str]]:
         "variables": {"titleSlug": title_slug},
     }
     try:
-        response = requests.post(LEETCODE_GRAPHQL, json=payload, timeout=REQUEST_TIMEOUT * 2)
+        response = requests.post(
+            LEETCODE_GRAPHQL, json=payload, timeout=REQUEST_TIMEOUT * 2)
         response.raise_for_status()
         question = (response.json().get("data") or {}).get("question")
         return question if question else None
@@ -310,7 +328,9 @@ def build_leetcode_prompt(user_text: str, language: str) -> Optional[str]:
     title = details.get("title", title_slug.replace("-", " ").title())
     content = unescape(re.sub(r"<[^>]+>", " ", details.get("content", "")))
     content = re.sub(r"\s+", " ", content).strip()
+    content = content[:2200]
     example_testcases = (details.get("exampleTestcases") or "").strip()
+    example_testcases = example_testcases[:800]
     difficulty = details.get("difficulty", "")
     starter_code = get_leetcode_code_snippet(details, language)
 
@@ -352,8 +372,10 @@ def looks_like_valid_leetcode_response(response_text: str, starter_code: str) ->
     if not response or not starter:
         return False
 
-    starter_lines = [line.rstrip() for line in starter.splitlines() if line.strip()]
-    response_lines = [line.rstrip() for line in response.splitlines() if line.strip()]
+    starter_lines = [line.rstrip()
+                     for line in starter.splitlines() if line.strip()]
+    response_lines = [line.rstrip()
+                      for line in response.splitlines() if line.strip()]
     if not starter_lines or not response_lines:
         return False
 
@@ -375,17 +397,26 @@ def rewrite_into_leetcode_template(
     starter_code: str,
     language: str,
 ) -> Tuple[Optional[str], Optional[str]]:
+    rewrite_prompt = (
+        "Rewrite the candidate solution into exact LeetCode submission format.\n"
+        "Return only code.\n"
+        "Preserve the official starter template structure exactly.\n"
+        "Do not include markdown fences or explanations.\n"
+        f"Language: {language}\n\n"
+        f"Official starter template:\n{starter_code}\n\n"
+        f"Candidate solution:\n{raw_response}"
+    )
+
+    if OPENROUTER_API_KEY:
+        rewritten, rewrite_error = solve_with_openrouter(rewrite_prompt)
+        if rewritten:
+            return rewritten, None
+        if rewrite_error:
+            return None, rewrite_error
+
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": (
-            "Rewrite the candidate solution into exact LeetCode submission format.\n"
-            "Return only code.\n"
-            "Preserve the official starter template structure exactly.\n"
-            "Do not include markdown fences or explanations.\n"
-            f"Language: {language}\n\n"
-            f"Official starter template:\n{starter_code}\n\n"
-            f"Candidate solution:\n{raw_response}"
-        ),
+        "prompt": rewrite_prompt,
         "stream": False,
     }
     try:
@@ -403,6 +434,52 @@ def rewrite_into_leetcode_template(
         return None, f"Template rewrite failed: {exc}"
     except Exception as exc:
         return None, f"Unexpected template rewrite error: {exc}"
+
+
+def solve_with_openrouter(prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    if not OPENROUTER_API_KEY:
+        return None, "OpenRouter API key is not configured."
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a coding assistant. Follow the user's formatting instructions exactly.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 1200,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://127.0.0.1:5000",
+        "X-Title": "Vortex AI",
+    }
+    try:
+        response = requests.post(
+            OPENROUTER_BASE_URL,
+            headers=headers,
+            json=payload,
+            timeout=OPENROUTER_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return None, "OpenRouter returned no choices."
+        message = choices[0].get("message") or {}
+        text = (message.get("content") or "").strip()
+        if text:
+            return text, None
+        return None, "OpenRouter returned an empty response."
+    except requests.RequestException as exc:
+        logging.warning("OpenRouter request failed: %s", exc)
+        return None, f"OpenRouter request failed: {exc}"
+    except Exception as exc:
+        logging.exception("Unexpected OpenRouter error")
+        return None, f"Unexpected OpenRouter error: {exc}"
 
 
 def solve_programming_with_ollama(user_text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -444,35 +521,69 @@ def solve_programming_with_ollama(user_text: str) -> Tuple[Optional[str], Option
         return None, f"Unexpected Ollama error: {exc}"
 
 
-def programming_response(user_text: str) -> str:
+def solve_programming_with_openrouter(user_text: str) -> Tuple[Optional[str], Optional[str]]:
+    language = detect_requested_language(user_text)
+    prompt = build_leetcode_prompt(user_text, language)
+    if not prompt:
+        prompt = (
+            "You are a coding assistant.\n"
+            "Return only the final code by default.\n"
+            "Do not add explanation, steps, complexity, comments before code, or example usage unless the user explicitly asks.\n"
+            f"If the language is unspecified, choose {language}.\n\n"
+            f"User request: {user_text}"
+        )
+    return solve_with_openrouter(prompt)
+
+
+def programming_response(user_text: str) -> Tuple[str, str, Optional[str]]:
     language = detect_requested_language(user_text)
     question_number = extract_leetcode_number(user_text)
-    ollama_answer, ollama_error = solve_programming_with_ollama(user_text)
-    if ollama_answer:
+    generated_answer = None
+    generated_error = None
+    response_source = "unknown"
+
+    openrouter_answer, openrouter_error = solve_programming_with_openrouter(
+        user_text)
+    if openrouter_answer:
+        generated_answer = openrouter_answer
+        response_source = "OpenRouter"
+    else:
+        if openrouter_error:
+            logging.info("Falling back to Ollama because OpenRouter failed: %s", openrouter_error)
+        ollama_answer, ollama_error = solve_programming_with_ollama(user_text)
+        if ollama_answer:
+            generated_answer = ollama_answer
+            response_source = "Ollama"
+        else:
+            generated_error = openrouter_error or ollama_error
+
+    if generated_answer:
         if question_number:
             title_slug = get_leetcode_problem_slug(question_number)
             if title_slug:
                 details = get_leetcode_problem_details(title_slug)
                 if details:
                     starter_code = get_leetcode_code_snippet(details, language)
-                    if starter_code and not looks_like_valid_leetcode_response(ollama_answer, starter_code):
+                    if starter_code and not looks_like_valid_leetcode_response(generated_answer, starter_code):
                         rewritten, rewrite_error = rewrite_into_leetcode_template(
-                            ollama_answer,
+                            generated_answer,
                             starter_code,
                             language,
                         )
                         if rewritten and looks_like_valid_leetcode_response(rewritten, starter_code):
-                            return rewritten
+                            return rewritten, response_source, generated_error
                         if rewrite_error:
-                            ollama_error = rewrite_error
-        return ollama_answer
+                            generated_error = rewrite_error
+        return generated_answer, response_source, generated_error
 
     return (
         f"{random.choice(HUMAN_OPENERS)}\n"
-        "I could not generate a code answer from the local model.\n"
-        f"Details: {ollama_error or 'No model response received.'}\n"
-        f"Model: {OLLAMA_MODEL}\n"
-        f"Server: {OLLAMA_BASE_URL}"
+        "I could not generate a code answer.\n"
+        f"Details: {generated_error or 'No model response received.'}\n"
+        f"OpenRouter model: {OPENROUTER_MODEL}\n"
+        f"Ollama model: {OLLAMA_MODEL}",
+        "error",
+        generated_error,
     )
 
 
@@ -522,16 +633,24 @@ def chat() -> object:
 
     if intent == "weather":
         response = get_weather_summary(extract_location(message))
+        source = "weather"
+        source_detail = None
     elif intent == "news":
         response = get_news_summary(extract_topic(message))
+        source = "news"
+        source_detail = None
     elif intent == "programming":
-        response = programming_response(message)
+        response, source, source_detail = programming_response(message)
     elif intent == "health":
         response = health_response(message)
+        source = "health"
+        source_detail = None
     else:
         response = chat_response(message)
+        source = "chat"
+        source_detail = None
 
-    return jsonify({"response": response, "intent": intent})
+    return jsonify({"response": response, "intent": intent, "source": source, "source_detail": source_detail})
 
 
 if __name__ == "__main__":
