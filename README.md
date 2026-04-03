@@ -16,9 +16,31 @@ python app.py
 
 Open: [http://127.0.0.1:5000](http://127.0.0.1:5000)
 
+## OpenRouter Setup
+
+For public-friendly code generation, configure an OpenRouter API key:
+
+```bash
+setx OPENROUTER_API_KEY "your_key_here"
+```
+
+You can also place the key in a local `.env` file as `OPENROUTER_API_KEY=...`.
+
+Optional model override:
+
+```bash
+setx OPENROUTER_MODEL "deepseek/deepseek-chat-v3-0324:free"
+```
+
+Then restart terminal and run:
+
+```bash
+python app.py
+```
+
 ## Ollama Setup
 
-For full local coding answers without any API key, install Ollama and pull a coding model.
+Ollama is still supported as a local fallback if OpenRouter is unavailable.
 
 1. Install Ollama from [https://ollama.com/download](https://ollama.com/download)
 2. Pull a model:
